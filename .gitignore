@@ -116,3 +116,6 @@ check_availability_log*.json
 
 # Local test fixtures
 test_contacts.csv
+
+# Per-day send budget state
+send_state.json

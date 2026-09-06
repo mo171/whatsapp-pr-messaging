@@ -4,6 +4,7 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { parse } = require('csv-parse/sync');
 const { getContactOptions, saveContact, removeContact, describeContactOptions } = require('./contact_manager');
+const pacing = require('./pacing');
 
 // Log file to track sent messages and avoid duplicates across runs
 const LOG_FILE = './sent_log.json';
@@ -12,14 +13,15 @@ const LOG_FILE = './sent_log.json';
 const ARGS = process.argv.slice(2).filter(a => !a.startsWith('--'));
 
 // Rate Limiting & Batching Configuration
-const BATCH_SIZE = 5;                   // Process 5 contacts per batch
-const PER_CONTACT_DELAY_MIN = 2000;      // 2 seconds minimum delay between individual contacts
-const PER_CONTACT_DELAY_MAX = 5000;      // 5 seconds maximum delay between individual contacts
-const BATCH_PAUSE_MIN = 30000;           // 30 seconds minimum pause after every 5 contacts
-const BATCH_PAUSE_MAX = 40000;           // 40 seconds maximum pause after every 5 contacts
+//
+// Delays are log-normal medians, not min/max windows, and the batch size is
+// drawn from an uneven pool rather than being a constant. See pacing.js for
+// why a flat random range and an every-Nth pause are both automation tells.
+const CONTACT_DELAY_MEDIAN = 40000;      // ~40s typical gap between contacts
+const BATCH_PAUSE_MEDIAN = 150000;       // ~2.5min typical pause after a batch
+const nextBatchSize = pacing.makeBatchSizer();   // uneven batch sizes, 3-8
 
-// Utility helper for async delays (human-like pacing)
-const delay = ms => new Promise(res => setTimeout(res, ms));
+const delay = pacing.delay;
 
 /**
  * Utility helper for Spintax resolution.
@@ -258,15 +260,43 @@ client.on('ready', async () => {
             }
         }
 
-        let contactsToProcess = [...uniqueContacts];
-        if (maxLimit < contactsToProcess.length) {
-            console.log(`🎯 Limit Applied: Processing first ${maxLimit} contacts out of ${uniqueContacts.length} available for this run.`);
-            contactsToProcess = contactsToProcess.slice(0, maxLimit);
+        // ── Daily budget & quiet hours ────────────────────────────────
+        // send_state.json tracks how many messages went out per calendar day,
+        // independently of sent_log.json (which only prevents duplicates).
+        const state = pacing.loadState();
+        const cap = pacing.todaysCap(state);
+        const already = pacing.sentToday(state);
+        const remainingToday = Math.max(0, cap - already);
+
+        if (pacing.inQuietHours()) {
+            console.log(`🌙 Quiet hours (${pacing.DEFAULTS.quietStartHour}:00-${pacing.DEFAULTS.quietEndHour}:00). Bulk sending at 3am is not something a human does — exiting.`);
+            console.log('   Override with --ignore-quiet-hours if you really mean to.');
+            if (!process.argv.includes('--ignore-quiet-hours')) {
+                await client.destroy();
+                process.exit(0);
+            }
+        }
+
+        console.log(`📅 Today's budget: ${already}/${cap} used, ${remainingToday} remaining.`);
+        if (remainingToday === 0) {
+            console.log('🛑 Daily cap reached. Stopping — come back tomorrow.');
+            await client.destroy();
+            process.exit(0);
+        }
+
+        // Shuffle so the send order does not mirror the CSV (registration
+        // order clusters teammates, who then compare identical messages).
+        let contactsToProcess = pacing.shuffle([...uniqueContacts]);
+
+        const effectiveLimit = Math.min(maxLimit, remainingToday);
+        if (effectiveLimit < contactsToProcess.length) {
+            console.log(`🎯 Limit Applied: Processing ${effectiveLimit} contacts out of ${uniqueContacts.length} available (run limit ${maxLimit === Infinity ? 'none' : maxLimit}, daily remaining ${remainingToday}).`);
+            contactsToProcess = contactsToProcess.slice(0, effectiveLimit);
         } else {
             console.log(`🎯 Limit: Processing all ${contactsToProcess.length} contact(s) for this run.`);
         }
 
-        console.log(`⚙️  Batch Configuration: ${BATCH_SIZE} contacts/batch, 2-5s contact delay, 30-40s batch pause\n`);
+        console.log(`⚙️  Pacing: uneven batches (3-8), ~${CONTACT_DELAY_MEDIAN / 1000}s median contact gap, ~${(BATCH_PAUSE_MEDIAN / 60000).toFixed(1)}min median batch pause\n`);
 
         // Step 1 Text: Intro Message Variations & Spintax Support
         let introVariations = [];
@@ -357,7 +387,12 @@ client.on('ready', async () => {
         // Step 3 Document: PDF Brochure
         let pdfMedia = null;
         const defaultBnbPdf = './BNB_26_Maharashtra_Brochure.pdf';
-        const pdfArg = ARGS[3] || (fs.existsSync(defaultBnbPdf) ? defaultBnbPdf : null);
+        // The PDF is OFF by default. A third media send per contact, carrying a
+        // byte-identical document hash into every chat, is one of the loudest
+        // bulk signals available. Re-enable deliberately with --pdf.
+        const wantPdf = process.argv.includes('--pdf');
+        const pdfArg = wantPdf ? (ARGS[3] || (fs.existsSync(defaultBnbPdf) ? defaultBnbPdf : null)) : null;
+        if (!wantPdf) console.log('📎 PDF brochure skipped (pass --pdf to include it).');
         if (pdfArg && fs.existsSync(pdfArg)) {
             pdfMedia = MessageMedia.fromFilePath(pdfArg);
             pdfMedia.filename = "BNB'26 Maharashtra Brochure.pdf";
@@ -370,7 +405,14 @@ client.on('ready', async () => {
 
         console.log(`\n🚀 Executing 3-Step Delivery Sequence for ${contactsToProcess.length} recipient(s):\n 1. Intro Message\n 2. Poster Image + Attached PR Caption\n 3. PDF Brochure Document\n`);
 
-        // Loop and send messages with 5-contact batching & 30-40s pauses
+        // Batch and session counters. Both targets are re-drawn every time
+        // they are hit, so no pause ever lands on a fixed multiple.
+        let batchTarget = nextBatchSize();
+        let sessionTarget = pacing.randInt(pacing.DEFAULTS.sessionMin, pacing.DEFAULTS.sessionMax);
+        let sentInBatch = 0;
+        let sentInSession = 0;
+        let consecutiveFailures = 0;
+
         for (let i = 0; i < contactsToProcess.length; i++) {
             const { number, name } = contactsToProcess[i];
             const chatId = `${number}@c.us`;
@@ -404,52 +446,82 @@ client.on('ready', async () => {
 
                     // ── STEP 1: Send Standalone Intro Message ──────────────────────
                     console.log(`📤 [Step 1/3] Sending Intro Text Message to ${number}...`);
+                    await pacing.simulateTyping(client, chatId, finalIntro);
                     await client.sendMessage(chatId, finalIntro);
                     console.log(`✅ Step 1: Intro Message sent to ${number}`);
 
-                    await delay(1500); // 1.5s pause between Step 1 and Step 2
+                    await delay(pacing.humanDelay(4000, { sigma: 0.45 })); // pause between Step 1 and Step 2
 
                     // ── STEP 2: Send Poster Image + Attached PR Message Caption ───
                     if (posterMedia) {
                         console.log(`📤 [Step 2/3] Sending Poster Image with attached PR Caption...`);
-                        await client.sendMessage(chatId, posterMedia, { caption: finalPR });
+                        // Fresh bytes per send: an identical poster hash landing in
+                        // hundreds of unrelated chats is the clearest broadcast signal.
+                        await pacing.simulateTyping(client, chatId, finalPR);
+                        await client.sendMessage(chatId, pacing.freshMedia(MessageMedia, posterPath), { caption: finalPR });
                         console.log(`✅ Step 2: Poster Image + PR Caption sent to ${number}`);
                     } else {
                         console.log(`📤 [Step 2/3] Sending PR Message Text...`);
+                        await pacing.simulateTyping(client, chatId, finalPR);
                         await client.sendMessage(chatId, finalPR);
                         console.log(`✅ Step 2: PR Text sent to ${number}`);
                     }
 
-                    await delay(1500); // 1.5s pause between Step 2 and Step 3
+                    await delay(pacing.humanDelay(5000, { sigma: 0.45 })); // pause between Step 2 and Step 3
 
                     // ── STEP 3: Send PDF Brochure Document ────────────────────────
                     if (pdfMedia) {
                         console.log(`📤 [Step 3/3] Sending PDF Brochure Document ("${pdfMedia.filename}")...`);
-                        await client.sendMessage(chatId, pdfMedia, { sendMediaAsDocument: true });
+                        const freshPdf = pacing.freshMedia(MessageMedia, pdfArg);
+                        freshPdf.filename = pdfMedia.filename;
+                        await client.sendMessage(chatId, freshPdf, { sendMediaAsDocument: true });
                         console.log(`✅ Step 3: PDF Brochure Document sent to ${number}`);
                     }
 
                     // Log sent contact immediately to sent_log.json
                     sentLogData.push(number);
                     fs.writeFileSync(LOG_FILE, JSON.stringify(sentLogData, null, 2));
+                    pacing.recordSend(state);
+                    consecutiveFailures = 0;
                 }
             } catch (err) {
                 console.error(`❌ Failed to send to ${number}:`, err.message);
+                consecutiveFailures++;
             }
 
             // Always clean up the temporary contact, even if a send failed above
             await removeContact(client, number, contactOptions, savedContact);
 
-            // Check if we reached the end of a 5-contact batch (and not at the very last contact)
-            const isBatchEnd = (i + 1) % BATCH_SIZE === 0;
-            const isLastContact = (i === contactsToProcess.length - 1);
+            // Bail out early rather than hammering a number WhatsApp has
+            // already started refusing — repeated failures usually mean the
+            // session is flagged, and continuing turns a warning into a ban.
+            if (consecutiveFailures >= 3) {
+                console.error(`\n🛑 ${consecutiveFailures} consecutive failures. Aborting this run to protect the account.\n`);
+                break;
+            }
 
-            if (isBatchEnd && !isLastContact) {
-                const batchPause = Math.floor(Math.random() * (BATCH_PAUSE_MAX - BATCH_PAUSE_MIN + 1) + BATCH_PAUSE_MIN);
-                console.log(`\n⏸️  [Batch Completed] Sent ${BATCH_SIZE} contacts. Pausing for ${(batchPause / 1000).toFixed(1)} seconds to prevent WhatsApp rate limits and allow message forwarding...\n`);
+            const isLastContact = (i === contactsToProcess.length - 1);
+            if (isLastContact) continue;
+
+            sentInBatch++;
+            sentInSession++;
+
+            if (sentInSession >= sessionTarget) {
+                const sessionBreak = pacing.humanDelay(pacing.DEFAULTS.sessionBreakMedian, { sigma: 0.3 });
+                console.log(`\n☕ [Session Completed] ${sentInSession} contacts done. Long break of ${(sessionBreak / 60000).toFixed(1)} minutes before the next session...\n`);
+                await delay(sessionBreak);
+                sentInSession = 0;
+                sentInBatch = 0;
+                sessionTarget = pacing.randInt(pacing.DEFAULTS.sessionMin, pacing.DEFAULTS.sessionMax);
+                batchTarget = nextBatchSize();
+            } else if (sentInBatch >= batchTarget) {
+                const batchPause = pacing.humanDelay(BATCH_PAUSE_MEDIAN, { sigma: 0.45 });
+                console.log(`\n⏸️  [Batch of ${batchTarget} Completed] Pausing ${(batchPause / 1000).toFixed(1)}s...\n`);
                 await delay(batchPause);
-            } else if (!isLastContact) {
-                const contactDelay = Math.floor(Math.random() * (PER_CONTACT_DELAY_MAX - PER_CONTACT_DELAY_MIN + 1) + PER_CONTACT_DELAY_MIN);
+                sentInBatch = 0;
+                batchTarget = nextBatchSize();
+            } else {
+                const contactDelay = pacing.humanDelay(CONTACT_DELAY_MEDIAN);
                 console.log(`⏳ Waiting ${(contactDelay / 1000).toFixed(1)}s before next contact...`);
                 await delay(contactDelay);
             }

@@ -165,12 +165,99 @@ This reduces risk; it does not eliminate it. Recipient **blocks and spam reports
 
 ---
 
-## 🛡️ Anti-Ban Best Practices
+## 🛡️ Anti-Ban Pipeline (`pacing.js`)
 
-1. **Daily Volume Limits**: Send in small batches (30–50 contacts per run) using `--limit=50`.
-2. **Use Spintax**: Keep `{option1|option2}` syntax in `intro.txt` and `template.txt` so every recipient gets a unique message.
-3. **Respect Rate Limits**: Keep batch pauses enabled (30–40s after every 5 contacts).
-4. **Lightweight Attachments**: Ensure PDFs remain compressed (<5 MB) to avoid browser socket timeouts.
+All timing, budgeting and media-fingerprint logic lives in `pacing.js` and is
+shared by `index.js` and `send_single.js`.
+
+**None of this defeats WhatsApp's detection.** It removes the *automation*
+signatures from your traffic. The dominant ban signal remains recipients
+tapping "Report spam" or blocking you — pacing cannot fix a message people
+don't want to receive.
+
+### What changed and why
+
+| Signature removed | How |
+| --- | --- |
+| Pause on exactly every 5th message | Batch size drawn from an uneven pool (3,4,6,7,4,8,3,5,6,4), reshuffled when exhausted — the average stays near 5, the pattern never repeats |
+| Flat (uniform) delay histogram with a hard floor and ceiling | Log-normal delays around a median, plus a ~12% chance of a 2–5× "put the phone down" outlier |
+| Identical media hash in hundreds of unrelated chats | `freshMedia()` appends random bytes after the JPEG EOI / PNG IEND (or a PDF comment line), so every send has a unique hash while the image is byte-for-byte identical when decoded |
+| 3 media sends per contact in ~3 seconds | The PDF is **off by default**; inter-step gaps are now 4–5s medians, humanised |
+| Send order mirroring the CSV | Contact list is shuffled, so teammates registered together don't receive back-to-back messages |
+| Injected messages with no presence events | `simulateTyping()` sends `sendSeen` → `sendStateTyping` for a duration scaled to message length, then clears state |
+| Sending at 3am / unbounded daily volume | Quiet hours 22:00–09:00 and a per-day cap tracked in `send_state.json` |
+| Full volume on a freshly recovered number | Warm-up ramp: 20 → 35 → 50 → 70 → 100 over the first five days |
+| Hammering a session WhatsApp has started refusing | Aborts after 3 consecutive send failures |
+
+### Pacing defaults
+
+| | `index.js` (3-step) | `send_single.js` (1-step) |
+| --- | --- | --- |
+| Median contact gap | ~40s | ~55s |
+| Median batch pause | ~2.5 min | ~3 min |
+| Batch size | 3–8, uneven | 3–8, uneven |
+| Session length | 15–25 contacts | 15–25 contacts |
+| Session break | ~35 min median | ~35 min median |
+
+At these settings **100 messages takes roughly 4–5 hours of wall clock**, which
+fits comfortably inside the 09:00–22:00 window. Start the run in the morning
+and leave it.
+
+### Daily budget
+
+`send_state.json` (created automatically) records messages sent per calendar
+day. It is separate from `sent_log.json`, which only prevents duplicate sends.
+
+```
+{ "days": { "2026-09-06": 42 }, "firstRunDate": "2026-09-06" }
+```
+
+The run exits when the cap is reached. Edit `DEFAULTS` in `pacing.js` to change
+the cap, quiet hours, session sizes or the warm-up ramp.
+
+### New flags
+
+```bash
+# Safest shape: one poster + caption per contact, no PDF, no follow-up burst
+node send_single.js contacts.csv --limit=100
+
+# 3-step sequence, PDF still skipped by default
+node index.js contacts.csv
+
+# Explicitly include the PDF brochure (adds a third media send per contact)
+node index.js contacts.csv --pdf
+
+# Bypass the 22:00-09:00 quiet-hours guard (not recommended)
+node send_single.js contacts.csv --ignore-quiet-hours
+```
+
+### Recovering from a block
+
+1. **Do not** run the script for 48–72 hours after the block lifts. Use the
+   number normally — reply to people, be in chats.
+2. Delete `send_state.json` so the warm-up ramp restarts from day 0 (20/day).
+3. Prefer `send_single.js` over `index.js`. One send per contact is far safer
+   than three.
+4. Reply to anyone who answers. Two-way conversation is the strongest positive
+   signal WhatsApp has, and inbound replies materially offset spam reports.
+5. If you have a second number, split the list across both rather than pushing
+   one number harder.
+
+### Things pacing cannot fix
+
+- **The link in the message.** `shorturl.at` is a URL shortener, and shorteners
+  in bulk broadcasts are heavily weighted. Use the real
+  `bitnbuild.gdgcrce.com` domain instead — it is yours, it is not a redirector,
+  and it looks legitimate to both WhatsApp and the reader.
+- **Messaging people who never opted in.** Contacts scraped from a registration
+  sheet for a *different* event have no relationship with you. Their "report"
+  taps are what got the number blocked.
+- **The message itself.** A wall of bold text, emoji and a price is
+  advertising, and it reads as advertising. Shorter and more personal gets
+  reported less.
+- **Broadcast lists.** WhatsApp's native broadcast list only delivers to people
+  who have *you* saved. That restriction is the point — it is the sanctioned
+  path, and it does not get you banned.
 
 ---
 
