@@ -93,7 +93,10 @@ async function removeContact(client, number, options, wasSaved) {
         await client.deleteAddressbookContact(number);
         console.log(`🧹 Removed temporary contact ${number} from address book.`);
     } catch (err) {
-        console.log(`⚠️  Could not remove contact ${number} (${err.message}). It may need deleting manually.`);
+        // deleteAddressbookContact rejects with truncated/empty messages on
+        // WA-Web desync — log everything available so the cause is visible.
+        const detail = (err && (err.message || err.toString())) || 'unknown error';
+        console.log(`⚠️  Could not remove contact ${number} (${detail}). It may need deleting manually.`);
     }
 }
 

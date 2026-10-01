@@ -109,6 +109,9 @@ npm start
 # 2. Specify Custom Contact Limit (e.g. 20 contacts)
 node index.js contacts.csv --limit=20
 
+# 2b. Use the actual CSV in this checkout and include the brochure
+node index.js contact.csv --limit=30 --pdf
+
 # 3. Process ALL Remaining Contacts (No Limit)
 node index.js contacts.csv --limit=all
 
@@ -185,8 +188,6 @@ don't want to receive.
 | 3 media sends per contact in ~3 seconds | The PDF is **off by default**; inter-step gaps are now 4–5s medians, humanised |
 | Send order mirroring the CSV | Contact list is shuffled, so teammates registered together don't receive back-to-back messages |
 | Injected messages with no presence events | `simulateTyping()` sends `sendSeen` → `sendStateTyping` for a duration scaled to message length, then clears state |
-| Sending at 3am / unbounded daily volume | Quiet hours 22:00–09:00 and a per-day cap tracked in `send_state.json` |
-| Full volume on a freshly recovered number | Warm-up ramp: 20 → 35 → 50 → 70 → 100 over the first five days |
 | Hammering a session WhatsApp has started refusing | Aborts after 3 consecutive send failures |
 
 ### Pacing defaults
@@ -203,7 +204,7 @@ At these settings **100 messages takes roughly 4–5 hours of wall clock**, whic
 fits comfortably inside the 09:00–22:00 window. Start the run in the morning
 and leave it.
 
-### Daily budget
+### Daily send counter
 
 `send_state.json` (created automatically) records messages sent per calendar
 day. It is separate from `sent_log.json`, which only prevents duplicate sends.
@@ -212,8 +213,10 @@ day. It is separate from `sent_log.json`, which only prevents duplicate sends.
 { "days": { "2026-09-06": 42 }, "firstRunDate": "2026-09-06" }
 ```
 
-The run exits when the cap is reached. Edit `DEFAULTS` in `pacing.js` to change
-the cap, quiet hours, session sizes or the warm-up ramp.
+It is **informational only** — nothing in the code caps a run or refuses to
+send at a given hour. How many contacts a run processes is decided entirely by
+`--limit` on the command line. Edit `DEFAULTS` in `pacing.js` to change session
+sizes and the length of the between-session break.
 
 ### New flags
 
@@ -227,15 +230,16 @@ node index.js contacts.csv
 # Explicitly include the PDF brochure (adds a third media send per contact)
 node index.js contacts.csv --pdf
 
-# Bypass the 22:00-09:00 quiet-hours guard (not recommended)
-node send_single.js contacts.csv --ignore-quiet-hours
+# Skip the intro and send only the poster + caption
+node send_single.js contacts.csv --limit=50 --no-intro
 ```
 
 ### Recovering from a block
 
 1. **Do not** run the script for 48–72 hours after the block lifts. Use the
    number normally — reply to people, be in chats.
-2. Delete `send_state.json` so the warm-up ramp restarts from day 0 (20/day).
+2. Ramp back up by hand — start with `--limit=20` for a few days before going
+   back to `--limit=100`. There is no automatic warm-up.
 3. Prefer `send_single.js` over `index.js`. One send per contact is far safer
    than three.
 4. Reply to anyone who answers. Two-way conversation is the strongest positive
@@ -258,6 +262,37 @@ node send_single.js contacts.csv --ignore-quiet-hours
 - **Broadcast lists.** WhatsApp's native broadcast list only delivers to people
   who have *you* saved. That restriction is the point — it is the sanctioned
   path, and it does not get you banned.
+
+---
+
+## 👥 Adding Team Leaders to WhatsApp Group
+
+The `add_team_leaders.js` script parses candidate registrations, extracts **Team Leaders**, verifies admin rights, and adds them directly to the specified WhatsApp group.
+
+### Features
+- 🔍 **Dynamic Filtering**: Filters for `Candidate role == 'Team Leader'` and auto-detects `Candidate's Mobile` / `Mobile`.
+- 🛡️ **Admin Validation**: Ensures your logged-in account has Admin privileges in the target group before proceeding.
+- ⚡ **Pre-Flight Deduplication**: Checks who is already a member of the group and skips them immediately.
+- 📩 **Privacy Restriction Handling (Code 403)**: Automatically sends a private group invite DM if a participant's WhatsApp privacy settings restrict direct addition.
+- 💾 **State Tracking**: Saves progress in `add_leaders_log.json` to allow resumption on interruption.
+
+### Commands
+
+```bash
+# 1. Preview candidates without launching WhatsApp Web
+node add_team_leaders.js --inspect-csv
+
+# 2. Dry-run test (connects to WhatsApp, verifies group & admin, lists members to be added)
+npm run add-leaders:dry
+# or: node add_team_leaders.js t1.csv --dry-run
+
+# 3. Add all Team Leaders from t1.csv to "BnB'26 Internal Round"
+npm run add-leaders
+# or: node add_team_leaders.js t1.csv
+
+# 4. Limit additions for testing (e.g. first 5 leaders)
+node add_team_leaders.js t1.csv --limit=5
+```
 
 ---
 

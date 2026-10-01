@@ -6,8 +6,50 @@ const { parse } = require('csv-parse/sync');
 const { getContactOptions, saveContact, removeContact, describeContactOptions } = require('./contact_manager');
 const pacing = require('./pacing');
 
+// A single WhatsApp Web session cannot safely be shared by two sender runs.
+const RUN_LOCK_FILE = path.resolve('.whatsapp-sender.lock');
+
+function acquireRunLock() {
+    if (fs.existsSync(RUN_LOCK_FILE)) {
+        const previousPid = Number.parseInt(fs.readFileSync(RUN_LOCK_FILE, 'utf8').trim(), 10);
+        if (Number.isInteger(previousPid)) {
+            try {
+                process.kill(previousPid, 0);
+                throw new Error(`Another sender run is already active (PID ${previousPid}). Stop it before starting again.`);
+            } catch (error) {
+                if (error.code !== 'ESRCH') throw error;
+            }
+        }
+        fs.rmSync(RUN_LOCK_FILE, { force: true });
+    }
+    fs.writeFileSync(RUN_LOCK_FILE, String(process.pid), { flag: 'wx' });
+}
+
+function releaseRunLock() {
+    try {
+        if (fs.existsSync(RUN_LOCK_FILE)) {
+            const ownerPid = Number.parseInt(fs.readFileSync(RUN_LOCK_FILE, 'utf8').trim(), 10);
+            if (ownerPid === process.pid) fs.rmSync(RUN_LOCK_FILE, { force: true });
+        }
+    } catch (error) {
+        console.error('⚠️ Could not remove sender lock:', error.message);
+    }
+}
+
+acquireRunLock();
+process.once('exit', releaseRunLock);
+process.once('SIGINT', () => { releaseRunLock(); process.exit(130); });
+process.once('SIGTERM', () => { releaseRunLock(); process.exit(143); });
+
 // Log file to track sent messages and avoid duplicates across runs
 const LOG_FILE = './sent_log.json';
+
+function markNumberSent(sentLogData, number) {
+    if (!sentLogData.includes(number)) {
+        sentLogData.push(number);
+        fs.writeFileSync(LOG_FILE, JSON.stringify(sentLogData, null, 2));
+    }
+}
 
 // Positional file arguments, ignoring any --flags (e.g. --limit=20, --keep-contacts)
 const ARGS = process.argv.slice(2).filter(a => !a.startsWith('--'));
@@ -17,8 +59,8 @@ const ARGS = process.argv.slice(2).filter(a => !a.startsWith('--'));
 // Delays are log-normal medians, not min/max windows, and the batch size is
 // drawn from an uneven pool rather than being a constant. See pacing.js for
 // why a flat random range and an every-Nth pause are both automation tells.
-const CONTACT_DELAY_MEDIAN = 40000;      // ~40s typical gap between contacts
-const BATCH_PAUSE_MEDIAN = 150000;       // ~2.5min typical pause after a batch
+const CONTACT_DELAY_MEDIAN = 10000;      // ~25s typical gap between contacts
+const BATCH_PAUSE_MEDIAN = 50000;        // ~1min typical pause after a batch
 const nextBatchSize = pacing.makeBatchSizer();   // uneven batch sizes, 3-8
 
 const delay = pacing.delay;
@@ -37,7 +79,7 @@ function applySpintax(text) {
 
 
 // Default text fallbacks if text files are missing
-const DEFAULT_INTRO = `Hey this is Varad from GDG CRCE. We are excited to announce that we are back with our flagship international hackathon BIT N BUILD. Looking forward to see you there!`;
+const DEFAULT_INTRO = `Hey this is Movin  from GDG CRCE. We are excited to announce that we are back with our flagship international hackathon BIT N BUILD. Looking forward to see you there!`;
 
 const DEFAULT_PR_MESSAGE = `*The* _Ultimate Stage_ *to compete against IITs, NITs, and premier global institutions* 🌍
 
@@ -75,6 +117,10 @@ Scarlett Menezes: +91 99217 58998
  */
 function getPuppeteerOptions() {
     const options = {
+        headless: false,
+        protocolTimeout: 300000,
+        timeout: 60000,
+        dumpio: process.env.WA_DEBUG === '1',
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -105,11 +151,37 @@ function getPuppeteerOptions() {
     return options;
 }
 
+const STARTUP_TIMEOUT_MS = Number.parseInt(process.env.WA_STARTUP_TIMEOUT_MS || '120000', 10);
+const AUTH_SESSION_DIR = path.resolve('.wwebjs_auth', 'session');
+
+const dismissWhatsAppWelcome = () => {
+    const clickContinue = () => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const continueButton = buttons.find(button => {
+            const text = (button.textContent || '').trim().toLowerCase();
+            return text === 'continue' && button.offsetParent !== null;
+        });
+        if (continueButton) continueButton.click();
+    };
+    new MutationObserver(clickContinue).observe(document, { childList: true, subtree: true });
+    setTimeout(clickContinue, 1000);
+};
+
+if (process.env.WA_RESET_AUTH === '1') {
+    console.log('🧹 Removing the saved WhatsApp session before startup...');
+    fs.rmSync(AUTH_SESSION_DIR, { recursive: true, force: true });
+}
+
 // Initialize WhatsApp Web Client with LocalAuth (persists session QR scan)
 const client = new Client({
     authStrategy: new LocalAuth(),
+    authTimeoutMs: 60000,
+    qrMaxRetries: 5,
+    userAgent: false,
+    evalOnNewDoc: dismissWhatsAppWelcome,
     puppeteer: getPuppeteerOptions()
 });
+let readyHandlerRunning = false;
 
 // Display QR code in the terminal when authentication is needed
 client.on('qr', (qr) => {
@@ -119,6 +191,11 @@ client.on('qr', (qr) => {
 
 // Event triggered once WhatsApp Web authentication succeeds
 client.on('ready', async () => {
+    if (readyHandlerRunning) {
+        console.warn('⚠️ Duplicate ready event ignored; a send run is already active.');
+        return;
+    }
+    readyHandlerRunning = true;
     console.log('\n✅ WhatsApp Client is authenticated and ready!');
 
     try {
@@ -163,6 +240,26 @@ client.on('ready', async () => {
                 phoneIndex = detectedPhoneIdx;
                 if (detectedNameIdx !== -1 && detectedNameIdx !== phoneIndex) nameIndex = detectedNameIdx;
                 startIndex = r + 1; // Skip up to this header row
+            }
+        }
+
+        // Headerless exports may include a serial-number column before the phone.
+        const hasPhoneHeader = records.slice(0, 5).some(row => row.some(cell => {
+            const value = (cell || '').toString().trim().toLowerCase();
+            return value.includes('phone') || value.includes('number') || value.includes('mobile');
+        }));
+        if (!hasPhoneHeader) {
+            const columnScores = new Map();
+            for (const row of records.slice(0, 20)) {
+                row.forEach((cell, column) => {
+                    const digits = (cell || '').toString().replace(/\D/g, '');
+                    if (digits.length >= 10 && digits.length <= 15) {
+                        columnScores.set(column, (columnScores.get(column) || 0) + 1);
+                    }
+                });
+            }
+            if (columnScores.size > 0) {
+                phoneIndex = [...columnScores.entries()].sort((a, b) => b[1] - a[1])[0][0];
             }
         }
 
@@ -260,38 +357,21 @@ client.on('ready', async () => {
             }
         }
 
-        // ── Daily budget & quiet hours ────────────────────────────────
-        // send_state.json tracks how many messages went out per calendar day,
+        // ── Daily send counter (informational only) ───────────────────
+        // send_state.json records how many messages went out per calendar day,
         // independently of sent_log.json (which only prevents duplicates).
+        // Nothing here caps the run — the only limit is the one you pass on
+        // the command line.
         const state = pacing.loadState();
-        const cap = pacing.todaysCap(state);
-        const already = pacing.sentToday(state);
-        const remainingToday = Math.max(0, cap - already);
+        console.log(`📅 Sent today so far: ${pacing.sentToday(state)}`);
 
-        if (pacing.inQuietHours()) {
-            console.log(`🌙 Quiet hours (${pacing.DEFAULTS.quietStartHour}:00-${pacing.DEFAULTS.quietEndHour}:00). Bulk sending at 3am is not something a human does — exiting.`);
-            console.log('   Override with --ignore-quiet-hours if you really mean to.');
-            if (!process.argv.includes('--ignore-quiet-hours')) {
-                await client.destroy();
-                process.exit(0);
-            }
-        }
+        // Preserve the source CSV order so runs are deterministic and resume
+        // from the earliest unmessaged contact.
+        let contactsToProcess = [...uniqueContacts];
 
-        console.log(`📅 Today's budget: ${already}/${cap} used, ${remainingToday} remaining.`);
-        if (remainingToday === 0) {
-            console.log('🛑 Daily cap reached. Stopping — come back tomorrow.');
-            await client.destroy();
-            process.exit(0);
-        }
-
-        // Shuffle so the send order does not mirror the CSV (registration
-        // order clusters teammates, who then compare identical messages).
-        let contactsToProcess = pacing.shuffle([...uniqueContacts]);
-
-        const effectiveLimit = Math.min(maxLimit, remainingToday);
-        if (effectiveLimit < contactsToProcess.length) {
-            console.log(`🎯 Limit Applied: Processing ${effectiveLimit} contacts out of ${uniqueContacts.length} available (run limit ${maxLimit === Infinity ? 'none' : maxLimit}, daily remaining ${remainingToday}).`);
-            contactsToProcess = contactsToProcess.slice(0, effectiveLimit);
+        if (maxLimit < contactsToProcess.length) {
+            console.log(`🎯 Limit Applied: Processing ${maxLimit} contacts out of ${uniqueContacts.length} available for this run.`);
+            contactsToProcess = contactsToProcess.slice(0, maxLimit);
         } else {
             console.log(`🎯 Limit: Processing all ${contactsToProcess.length} contact(s) for this run.`);
         }
@@ -383,20 +463,20 @@ client.on('ready', async () => {
             posterMedia = MessageMedia.fromFilePath(posterPath);
             console.log(`🖼️  Loaded Step 2 Poster Image: "${posterPath}"`);
         }
-
         // Step 3 Document: PDF Brochure
         let pdfMedia = null;
         const defaultBnbPdf = './BNB_26_Maharashtra_Brochure.pdf';
-        // The PDF is OFF by default. A third media send per contact, carrying a
-        // byte-identical document hash into every chat, is one of the loudest
-        // bulk signals available. Re-enable deliberately with --pdf.
-        const wantPdf = process.argv.includes('--pdf');
+        const wantPdf = !process.argv.includes('--no-pdf');
         const pdfArg = wantPdf ? (ARGS[3] || (fs.existsSync(defaultBnbPdf) ? defaultBnbPdf : null)) : null;
-        if (!wantPdf) console.log('📎 PDF brochure skipped (pass --pdf to include it).');
-        if (pdfArg && fs.existsSync(pdfArg)) {
+        if (!wantPdf) {
+            console.log('📎 PDF brochure disabled via --no-pdf.');
+        } else if (pdfArg && fs.existsSync(pdfArg)) {
             pdfMedia = MessageMedia.fromFilePath(pdfArg);
             pdfMedia.filename = "BNB'26 Maharashtra Brochure.pdf";
-            console.log(`📎 Loaded Step 3 PDF Brochure: "${pdfArg}" (WhatsApp Display Title: "${pdfMedia.filename}")`);
+            const pdfMB = (fs.statSync(pdfArg).size / 1048576).toFixed(1);
+            console.log(`📎 Loaded Step 3 PDF Brochure: "${pdfArg}" (${pdfMB}MB, WhatsApp Display Title: "${pdfMedia.filename}")`);
+        } else {
+            console.log(`⚠️  PDF brochure not found at "${defaultBnbPdf}".`);
         }
 
         // Temporary address-book handling (save before send, delete after)
@@ -424,8 +504,7 @@ client.on('ready', async () => {
                 const isRegistered = await client.isRegisteredUser(chatId);
                 if (!isRegistered) {
                     console.log(`❌ Number ${number} is not registered on WhatsApp. Logging and skipping.`);
-                    sentLogData.push(number);
-                    fs.writeFileSync(LOG_FILE, JSON.stringify(sentLogData, null, 2));
+                    markNumberSent(sentLogData, number);
                 } else {
                     // Rotate through available intro and PR template variations
                     const rawIntro = introVariations[i % introVariations.length];
@@ -449,17 +528,30 @@ client.on('ready', async () => {
                     await pacing.simulateTyping(client, chatId, finalIntro);
                     await client.sendMessage(chatId, finalIntro);
                     console.log(`✅ Step 1: Intro Message sent to ${number}`);
+                    // Step 1 was delivered, so do not resend it if a later media step fails.
+                    markNumberSent(sentLogData, number);
 
                     await delay(pacing.humanDelay(4000, { sigma: 0.45 })); // pause between Step 1 and Step 2
 
                     // ── STEP 2: Send Poster Image + Attached PR Message Caption ───
                     if (posterMedia) {
                         console.log(`📤 [Step 2/3] Sending Poster Image with attached PR Caption...`);
-                        // Fresh bytes per send: an identical poster hash landing in
-                        // hundreds of unrelated chats is the clearest broadcast signal.
                         await pacing.simulateTyping(client, chatId, finalPR);
-                        await client.sendMessage(chatId, pacing.freshMedia(MessageMedia, posterPath), { caption: finalPR });
-                        console.log(`✅ Step 2: Poster Image + PR Caption sent to ${number}`);
+                        const sendPosterOnce = () =>
+                            client.sendMessage(chatId, pacing.freshMedia(MessageMedia, posterPath), { caption: finalPR });
+                        try {
+                            await sendPosterOnce();
+                            console.log(`✅ Step 2: Poster Image + PR Caption sent to ${number}`);
+                        } catch (mediaErr) {
+                            console.warn(`⚠️ Step 2 media send failed (${mediaErr.message}). Retrying in 3s...`);
+                            try {
+                                await delay(3000);
+                                await sendPosterOnce();
+                                console.log(`✅ Step 2 (retry): Poster Image + PR Caption sent to ${number}`);
+                            } catch (retryErr) {
+                                console.error(`❌ Step 2 image failed twice (${retryErr.message}).`);
+                            }
+                        }
                     } else {
                         console.log(`📤 [Step 2/3] Sending PR Message Text...`);
                         await pacing.simulateTyping(client, chatId, finalPR);
@@ -472,32 +564,36 @@ client.on('ready', async () => {
                     // ── STEP 3: Send PDF Brochure Document ────────────────────────
                     if (pdfMedia) {
                         console.log(`📤 [Step 3/3] Sending PDF Brochure Document ("${pdfMedia.filename}")...`);
-                        const freshPdf = pacing.freshMedia(MessageMedia, pdfArg);
-                        freshPdf.filename = pdfMedia.filename;
-                        await client.sendMessage(chatId, freshPdf, { sendMediaAsDocument: true });
-                        console.log(`✅ Step 3: PDF Brochure Document sent to ${number}`);
+                        const sendPdfOnce = () => client.sendMessage(chatId, pdfMedia, { sendMediaAsDocument: true });
+                        try {
+                            await sendPdfOnce();
+                            console.log(`✅ Step 3: PDF Brochure Document sent to ${number}`);
+                        } catch (pdfErr) {
+                            console.warn(`⚠️ Step 3 PDF failed (${pdfErr.message || pdfErr}). Retrying once in 5s...`);
+                            try {
+                                await delay(5000);
+                                await sendPdfOnce();
+                                console.log(`✅ Step 3 (retry): PDF Brochure Document sent to ${number}`);
+                            } catch (retryPdfErr) {
+                                console.error(`❌ Step 3 PDF failed twice for ${number}: ${retryPdfErr.message || retryPdfErr}`);
+                            }
+                        }
                     }
 
-                    // Log sent contact immediately to sent_log.json
-                    sentLogData.push(number);
-                    fs.writeFileSync(LOG_FILE, JSON.stringify(sentLogData, null, 2));
                     pacing.recordSend(state);
                     consecutiveFailures = 0;
                 }
             } catch (err) {
-                console.error(`❌ Failed to send to ${number}:`, err.message);
+                console.error(`❌ Failed to send to ${number}:`, err.message || err);
+                if (err && err.stack) console.error(err.stack.split('\n').slice(0, 4).join('\n'));
                 consecutiveFailures++;
             }
 
             // Always clean up the temporary contact, even if a send failed above
             await removeContact(client, number, contactOptions, savedContact);
 
-            // Bail out early rather than hammering a number WhatsApp has
-            // already started refusing — repeated failures usually mean the
-            // session is flagged, and continuing turns a warning into a ban.
             if (consecutiveFailures >= 3) {
-                console.error(`\n🛑 ${consecutiveFailures} consecutive failures. Aborting this run to protect the account.\n`);
-                break;
+                console.warn(`\n⚠️ ${consecutiveFailures} consecutive failures. Continuing with the remaining contacts.\n`);
             }
 
             const isLastContact = (i === contactsToProcess.length - 1);
@@ -541,5 +637,43 @@ client.on('ready', async () => {
     }
 });
 
+client.on('auth_failure', (message) => {
+    console.error(`\n❌ WhatsApp authentication failed: ${message}`);
+});
+
+client.on('loading_screen', (percent, message) => {
+    console.log(`⏳ WhatsApp Web loading: ${percent}%${message ? ` (${message})` : ''}`);
+});
+
+client.on('change_state', (state) => {
+    console.log(`🔄 WhatsApp client state: ${state}`);
+});
+
+client.on('disconnected', (reason) => {
+    console.error(`\n⚠️ WhatsApp client disconnected: ${reason}`);
+});
+
 // Start WhatsApp Client initialization
-client.initialize();
+console.log('🔄 Starting WhatsApp client initialization...');
+let startupTimedOut = false;
+const startupTimer = setTimeout(async () => {
+    startupTimedOut = true;
+    console.error(`\n❌ WhatsApp startup timed out after ${STARTUP_TIMEOUT_MS / 1000}s.`);
+    console.error('   If this follows an interrupted run, close Chrome and retry with WA_RESET_AUTH=1.');
+    try {
+        await client.destroy();
+    } catch (error) {
+        console.error('⚠️ Could not close the WhatsApp browser cleanly:', error.message);
+    }
+    process.exit(1);
+}, STARTUP_TIMEOUT_MS);
+
+client.initialize().then(() => {
+    if (!startupTimedOut) {
+        clearTimeout(startupTimer);
+    }
+}).catch((error) => {
+    clearTimeout(startupTimer);
+    console.error('❌ Failed to initialize WhatsApp client:', error);
+    process.exit(1);
+});

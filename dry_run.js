@@ -25,7 +25,14 @@ let readyCb = null;
 
 class MockClient extends EventEmitter {
     constructor() { super(); }
-    initialize() { setImmediate(() => this.emit('ready')); }
+    initialize() {
+        return new Promise(resolve => {
+            setImmediate(() => {
+                this.emit('ready');
+                resolve();
+            });
+        });
+    }
     async destroy() {}
 
     async isRegisteredUser(id) {
@@ -64,9 +71,17 @@ class MockClient extends EventEmitter {
 }
 
 class MockLocalAuth {}
-const MockMessageMedia = {
-    fromFilePath(p) { return { mimetype: 'mock', filename: path.basename(p), data: '' }; }
-};
+class MockMessageMedia {
+    constructor(mimetype = 'mock', data = '', filename = '') {
+        this.mimetype = mimetype;
+        this.data = data;
+        this.filename = filename;
+    }
+
+    static fromFilePath(filePath) {
+        return new MockMessageMedia('mock', '', path.basename(filePath));
+    }
+}
 
 // ── Intercept require('whatsapp-web.js') and qrcode-terminal ────────────────
 const realResolve = Module._resolveFilename;

@@ -17,7 +17,7 @@ const ARGS = process.argv.slice(2).filter(a => !a.startsWith('--'));
 // One media+caption per contact is the safest shape available: a single send,
 // no follow-up burst. Delays are log-normal medians with occasional long
 // outliers; batch sizes come from an uneven pool. See pacing.js.
-const CONTACT_DELAY_MEDIAN = 55000;      // ~55s typical gap between contacts
+const CONTACT_DELAY_MEDIAN = 70000;      // ~55s typical gap between contacts
 const BATCH_PAUSE_MEDIAN = 180000;       // ~3min typical pause after a batch
 const nextBatchSize = pacing.makeBatchSizer();   // uneven batch sizes, 3-8
 
@@ -34,6 +34,9 @@ function applySpintax(text) {
         return options[Math.floor(Math.random() * options.length)].trim();
     });
 }
+
+// Fallback intro used when no intro.txt / intro1..3.txt is present
+const DEFAULT_INTRO = `Hey this is Movin  from GDG CRCE. We are excited to announce that we are back with our flagship international hackathon BIT N BUILD. Looking forward to see you there!`;
 
 /**
  * Configure Puppeteer launch options cross-platform (Windows, macOS, Linux).
@@ -92,7 +95,7 @@ client.on('ready', async () => {
 
         if (!csvFile) {
             console.error('❌ Error: No CSV file provided!');
-            console.log('Usage: node send_single.js <contacts.csv> [template.txt] [poster.jpg] [--limit=50]');
+            console.log('Usage: node send_single.js <contacts.csv> [template.txt] [poster.jpg] [--limit=50] [--no-intro]');
             console.log('Example: node send_single.js contacts.csv --limit=20');
             await client.destroy();
             process.exit(1);
@@ -223,42 +226,68 @@ client.on('ready', async () => {
             }
         }
 
-        // ── Daily budget & quiet hours ────────────────────────────────
-        // send_state.json tracks how many messages went out per calendar day,
+        // ── Daily send counter (informational only) ───────────────────
+        // send_state.json records how many messages went out per calendar day,
         // independently of sent_log.json (which only prevents duplicates).
+        // Nothing here caps the run — the only limit is the one you pass on
+        // the command line.
         const state = pacing.loadState();
-        const cap = pacing.todaysCap(state);
-        const already = pacing.sentToday(state);
-        const remainingToday = Math.max(0, cap - already);
-
-        if (pacing.inQuietHours()) {
-            console.log(`🌙 Quiet hours (${pacing.DEFAULTS.quietStartHour}:00-${pacing.DEFAULTS.quietEndHour}:00). Bulk sending at 3am is not something a human does — exiting.`);
-            console.log('   Override with --ignore-quiet-hours if you really mean to.');
-            if (!process.argv.includes('--ignore-quiet-hours')) {
-                await client.destroy();
-                process.exit(0);
-            }
-        }
-
-        console.log(`📅 Today's budget: ${already}/${cap} used, ${remainingToday} remaining.`);
-        if (remainingToday === 0) {
-            console.log('🛑 Daily cap reached. Stopping — come back tomorrow.');
-            await client.destroy();
-            process.exit(0);
-        }
+        console.log(`📅 Sent today so far: ${pacing.sentToday(state)}`);
 
         // Shuffle so the send order does not mirror the CSV (registration
         // order clusters teammates, who then compare identical messages).
         let contactsToProcess = pacing.shuffle([...uniqueContacts]);
 
-        const effectiveLimit = Math.min(maxLimit, remainingToday);
-        if (effectiveLimit < contactsToProcess.length) {
-            console.log(`🎯 Limit Applied: Processing ${effectiveLimit} contacts out of ${uniqueContacts.length} available (run limit ${maxLimit === Infinity ? 'none' : maxLimit}, daily remaining ${remainingToday}).`);
-            contactsToProcess = contactsToProcess.slice(0, effectiveLimit);
+        if (maxLimit < contactsToProcess.length) {
+            console.log(`🎯 Limit Applied: Processing ${maxLimit} contacts out of ${uniqueContacts.length} available for this run.`);
+            contactsToProcess = contactsToProcess.slice(0, maxLimit);
         } else {
             console.log(`🎯 Limit: Processing all ${contactsToProcess.length} contact(s) for this run.`);
         }
 
+
+        // Step 1 Text: Intro Message Variations & Spintax Support
+        //
+        // Positional args stay backwards compatible (ARGS[1] = template,
+        // ARGS[2] = poster), so the intro is picked up from ./intro.txt and the
+        // intro1..3 variants. Pass --no-intro to fall back to a single send.
+        let introVariations = [];
+        const sendIntro = !process.argv.includes('--no-intro');
+
+        if (sendIntro) {
+            const introFile = fs.existsSync('./intro.txt') ? './intro.txt' : null;
+
+            if (introFile) {
+                const rawIntro = fs.readFileSync(introFile, 'utf-8').trim();
+                if (rawIntro.includes('---')) {
+                    introVariations = rawIntro.split('---').map(s => s.trim()).filter(Boolean);
+                    console.log(`📝 Loaded ${introVariations.length} Intro Message variations from "${introFile}" (separated by '---')`);
+                } else if (rawIntro) {
+                    introVariations.push(rawIntro);
+                    console.log(`📝 Loaded Step 1 Intro Message from "${introFile}"`);
+                }
+            }
+
+            // Check for standalone files (intro1.txt, intro2.txt, intro3.txt)
+            const standaloneIntroFiles = ['./intro1.txt', './intro2.txt', './intro3.txt', './intro_1.txt', './intro_2.txt', './intro_3.txt'];
+            for (const file of standaloneIntroFiles) {
+                if (fs.existsSync(file)) {
+                    const content = fs.readFileSync(file, 'utf-8').trim();
+                    if (content && !introVariations.includes(content)) {
+                        introVariations.push(content);
+                        console.log(`📝 Loaded additional Intro variation from "${file}"`);
+                    }
+                }
+            }
+
+            if (introVariations.length === 0) {
+                introVariations = [DEFAULT_INTRO];
+            }
+
+            console.log(`ℹ️  Total active Intro Message variations: ${introVariations.length}`);
+        } else {
+            console.log('⏭️  Intro message skipped (--no-intro).');
+        }
 
         // Step 2 Caption: PR Message Variations & Spintax Support
         let prVariations = [];
@@ -315,7 +344,7 @@ client.on('ready', async () => {
             console.log(`🖼️  Loaded Poster Image: "${posterPath}"`);
         }
 
-        console.log(`\n🚀 Executing SINGLE-STEP Delivery (Poster Image + Attached PR Caption) for ${contactsToProcess.length} recipient(s)\n`);
+        console.log(`\n🚀 Executing ${sendIntro ? '2-STEP' : 'SINGLE-STEP'} Delivery for ${contactsToProcess.length} recipient(s)\n`);
         console.log(`⚙️  Pacing: uneven batches (3-8), ~${CONTACT_DELAY_MEDIAN / 1000}s median contact gap, ~${(BATCH_PAUSE_MEDIAN / 60000).toFixed(1)}min median batch pause\n`);
 
         // Temporary address-book handling (save before send, delete after)
@@ -357,14 +386,37 @@ client.on('ready', async () => {
                     // ── Temporarily save the recipient as a contact ─────────────
                     savedContact = await saveContact(client, number, name, contactOptions);
 
-                    // ── SINGLE STEP: Send Poster Image with Attached PR Message Caption ───
+                    // ── STEP 1: Send Standalone Intro Message ───────────────────
+                    if (sendIntro) {
+                        let finalIntro = introVariations[i % introVariations.length];
+                        finalIntro = finalIntro.replace(/\{\{name\}\}\s*/g, '');
+                        finalIntro = applySpintax(finalIntro);
+
+                        console.log(`📤 [Step 1/2] Sending Intro Text Message to ${number}...`);
+                        await pacing.simulateTyping(client, chatId, finalIntro);
+                        await client.sendMessage(chatId, finalIntro);
+                        console.log(`✅ Step 1: Intro Message sent to ${number}`);
+
+                        await delay(pacing.humanDelay(4000, { sigma: 0.45 })); // pause between Step 1 and Step 2
+                    }
+
+                    // ── STEP 2: Send Poster Image with Attached PR Message Caption ───
                     if (posterMedia) {
-                        console.log(`📤 Sending Poster Image with attached PR Caption to ${number}...`);
+                        console.log(`📤 [Step 2/2] Sending Poster Image with attached PR Caption to ${number}...`);
                         await pacing.simulateTyping(client, chatId, finalPR);
-                        // Fresh bytes per send so the poster does not carry one
-                        // identical media hash into every chat.
-                        await client.sendMessage(chatId, pacing.freshMedia(MessageMedia, posterPath), { caption: finalPR });
-                        console.log(`✅ SUCCESS: Poster Image + PR Caption sent to ${number}`);
+                        try {
+                            await client.sendMessage(chatId, pacing.freshMedia(MessageMedia, posterPath), { caption: finalPR });
+                            console.log(`✅ Step 2: Poster Image + PR Caption sent to ${number}`);
+                        } catch (mediaErr) {
+                            console.warn(`⚠️ Step 2 media send failed (${mediaErr.message}). Retrying...`);
+                            try {
+                                await delay(3000);
+                                await client.sendMessage(chatId, pacing.freshMedia(MessageMedia, posterPath), { caption: finalPR });
+                                console.log(`✅ Step 2 (retry): Poster Image + PR Caption sent to ${number}`);
+                            } catch (retryErr) {
+                                console.error(`❌ Step 2 image failed twice (${retryErr.message}).`);
+                            }
+                        }
                     } else {
                         console.log(`📤 Sending PR Message Text to ${number}...`);
                         await pacing.simulateTyping(client, chatId, finalPR);

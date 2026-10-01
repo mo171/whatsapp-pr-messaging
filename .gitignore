@@ -108,8 +108,12 @@ trace/
 node_modules/
 .wwebjs_auth/
 .wwebjs_cache/
+.whatsapp-sender.lock
+.whatsapp-group-adder.lock
 sent_log.json
 sent_log*.json
+add_leaders_log.json
+add_leaders_log*.json
 check_availability_log.json
 check_availability_log*.json
 

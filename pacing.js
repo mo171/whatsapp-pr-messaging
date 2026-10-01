@@ -1,8 +1,10 @@
 /**
  * pacing.js
  *
- * Human-like pacing, daily budgeting and media-fingerprint breaking for the
- * WhatsApp senders.
+ * Human-like pacing and media-fingerprint breaking for the WhatsApp senders.
+ *
+ * This module does not cap anything. How many contacts a run processes is
+ * decided entirely by the --limit flag on the command line.
  *
  * The old pacing used a fixed batch size of 5 and uniform random delays. Both
  * are machine signatures: a uniform distribution has a flat histogram and a
@@ -76,16 +78,12 @@ function makeBatchSizer(pool = BATCH_POOL) {
     };
 }
 
-// ── Daily budget / quiet hours ────────────────────────────────────────────────
+// ── Daily send counter (informational) ────────────────────────────────────────────────
 
 const DEFAULTS = {
-    dailyCap: 100,          // messages per calendar day
-    sessionMin: 15,         // contacts before a long "put the phone down" break
-    sessionMax: 25,
+    sessionMin: 30,         // keep a --limit=30 run in one session
+    sessionMax: 30,
     sessionBreakMedian: 35 * 60 * 1000,  // ~35 min between sessions
-    quietStartHour: 22,     // no sends from 22:00 ...
-    quietEndHour: 9,        // ... until 09:00 local time
-    warmupDays: [20, 35, 50, 70, 100], // ramp on a fresh / recovered number
 };
 
 function todayKey(d = new Date()) {
@@ -113,31 +111,6 @@ function recordSend(state, file = STATE_FILE) {
     const k = todayKey();
     state.days[k] = (state.days[k] || 0) + 1;
     saveState(state, file);
-}
-
-/** Days elapsed since the very first run, used to pick a warm-up cap. */
-function daysSinceFirstRun(state) {
-    const start = new Date(state.firstRunDate + 'T00:00:00');
-    return Math.floor((Date.now() - start.getTime()) / 86400000);
-}
-
-/**
- * Effective cap for today: the warm-up ramp for the first few days, then the
- * configured daily cap. Warm-up matters most right after an unblock — jumping
- * straight back to 100/day on a freshly restored number is the fastest way to
- * get re-banned.
- */
-function todaysCap(state, cfg = DEFAULTS) {
-    const d = daysSinceFirstRun(state);
-    if (d < cfg.warmupDays.length) return Math.min(cfg.warmupDays[d], cfg.dailyCap);
-    return cfg.dailyCap;
-}
-
-function inQuietHours(cfg = DEFAULTS, now = new Date()) {
-    const h = now.getHours();
-    return cfg.quietEndHour > cfg.quietStartHour
-        ? (h >= cfg.quietStartHour && h < cfg.quietEndHour)
-        : (h >= cfg.quietStartHour || h < cfg.quietEndHour);
 }
 
 // ── Typing simulation ─────────────────────────────────────────────────────────
@@ -189,7 +162,7 @@ function freshMedia(MessageMedia, filePath) {
         ? Buffer.from(`\n%${rand}\n`, 'latin1')
         : Buffer.from(rand, 'hex');
     const mixed = Buffer.concat([buf, noise]);
-    return new MessageMedia(mime, mixed.toString('base64'), filePath.split(/[\/]/).pop());
+    return new MessageMedia(mime, mixed.toString('base64'), filePath.split(/[\\/]/).pop());
 }
 
 module.exports = {
@@ -204,8 +177,6 @@ module.exports = {
     saveState,
     sentToday,
     recordSend,
-    todaysCap,
-    inQuietHours,
     todayKey,
     simulateTyping,
     freshMedia,
